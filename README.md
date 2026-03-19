@@ -239,8 +239,10 @@ function json(data, status = 200) {
 
 | Variable name | Value |
 |---|---|
-| `FREEMAIL_TOKEN` | 自定义密码（记住，后面要填入 .env） |
+| `FREEMAIL_TOKEN` | 普通密码（密码:限制创建邮箱数量）如abc123:5,def456:10,ghi789:0 |
+| `ADMIN_TOKEN` | 管理员密码(无限制，可管理普通token)，如 `admin` |
 | `DOMAIN` | 你的域名，如 `example.com` |
+如若普通密码创建邮箱达到上限，需重置数量，请使用tokeny.py，详情看脚本
 
 ### 1.5 开启 Email Routing
 
