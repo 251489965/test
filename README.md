@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS mails (
     verification_code TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS token_usage (
+    token TEXT PRIMARY KEY,
+    used_mailboxes INTEGER DEFAULT 0
+);
 ```
 
 ### 1.2 创建 Worker
@@ -68,13 +73,33 @@ export default {
     const auth = request.headers.get('Authorization');
     if (!auth || !auth.startsWith('Bearer ')) return json({ error: 'Unauthorized' }, 401);
     const token = auth.slice(7);
-    if (token !== env.FREEMAIL_TOKEN) return json({ error: 'Unauthorized' }, 401);
-    if (request.method === 'GET' && url.pathname === '/api/generate') return handleGenerate(env);
-    if (request.method === 'GET' && url.pathname === '/api/emails') return handleEmails(url, env);
-    if (request.method === 'DELETE' && url.pathname === '/api/mailboxes') return handleDelete(url, env);
+
+    const allowedTokens = parseTokens(env.FREEMAIL_TOKENS || '');
+    const isAdmin = token === (env.ADMIN_TOKEN || '');
+
+    // 任意有效 token（普通或管理员）均可访问 API
+    if (allowedTokens[token] === undefined && !isAdmin) {
+      return json({ error: 'Unauthorized' }, 401);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/generate') {
+      return handleGenerate(token, isAdmin, env);
+    }
+    if (request.method === 'GET' && url.pathname === '/api/emails') {
+      return handleEmails(url, env);
+    }
+    if (request.method === 'DELETE' && url.pathname === '/api/mailboxes') {
+      return handleDelete(url, env);
+    }
+    if (request.method === 'POST' && url.pathname === '/api/reset') {
+      return handleReset(url, env, isAdmin);
+    }
+
     return json({ error: 'Not Found' }, 404);
   },
+
   async email(message, env) {
+    // 原 incoming email 处理逻辑完全不变
     const to = message.to;
     const from = message.from;
     const reader = message.raw.getReader();
@@ -101,15 +126,80 @@ export default {
   }
 };
 
-async function handleGenerate(env) {
+// ==================== 新增工具函数 ====================
+function parseTokens(tokensStr) {
+  const map = {};
+  if (!tokensStr) return map;
+  tokensStr.split(',').forEach(pair => {
+    const trimmed = pair.trim();
+    if (!trimmed) return;
+    const [t, lim] = trimmed.split(':');
+    if (t) {
+      const tokenKey = t.trim();
+      const limit = lim ? parseInt(lim.trim(), 10) : 0;
+      map[tokenKey] = isNaN(limit) ? 0 : limit;
+    }
+  });
+  return map;
+}
+
+// ==================== 修改后的 handleGenerate（带配额控制） ====================
+async function handleGenerate(token, isAdmin, env) {
+  // 普通 token 配额检查（管理员无限制）
+  if (!isAdmin) {
+    const allowed = parseTokens(env.FREEMAIL_TOKENS || '');
+    const max = allowed[token] !== undefined ? allowed[token] : 0;
+    if (max > 0) {
+      const usage = await env.DB.prepare(
+        'SELECT used_mailboxes FROM token_usage WHERE token = ?'
+      ).bind(token).first();
+      const used = usage ? usage.used_mailboxes : 0;
+      if (used >= max) {
+        return json({
+          success: false,
+          message: `创建失败：已达到上限（${used}/${max}）`,
+          hint: "请联系管理员重置，或使用其他账号"
+        }, 429);
+      }
+    }
+  }
+
+  // 生成邮箱（原逻辑不变）
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let name = '';
   for (let i = 0; i < 10; i++) name += chars[Math.floor(Math.random() * chars.length)];
   const address = `${name}@${env.DOMAIN}`;
+
   await env.DB.prepare('INSERT OR IGNORE INTO mail_boxes (address) VALUES (?)').bind(address).run();
+
+  // 非管理员才计入配额
+  if (!isAdmin) {
+    await env.DB.prepare(
+      'INSERT INTO token_usage (token, used_mailboxes) VALUES (?, 1) ON CONFLICT(token) DO UPDATE SET used_mailboxes = used_mailboxes + 1'
+    ).bind(token).run();
+  }
+
   return json({ email: address });
 }
 
+// ==================== 新增管理员重置接口（POST /api/reset?target=要重置的token） ====================
+async function handleReset(url, env, isAdmin) {
+  if (!isAdmin) {
+    return json({ error: 'Admin access only' }, 403);
+  }
+  const target = url.searchParams.get('target');
+  if (!target) {
+    return json({ error: 'target required' }, 400);
+  }
+
+  await env.DB.prepare(
+    'INSERT INTO token_usage (token, used_mailboxes) VALUES (?, 0) ON CONFLICT(token) DO UPDATE SET used_mailboxes = 0'
+  ).bind(target).run();
+
+  return json({ success: true, message: `Quota reset for token: ${target}` });
+}
+
+// ==================== 以下函数完全保持原样 ====================
 async function handleEmails(url, env) {
   const mailbox = url.searchParams.get('mailbox');
   if (!mailbox) return json({ error: 'mailbox required' }, 400);
